@@ -17,13 +17,14 @@ import tradeig  # noqa: E402
 
 
 def make_market(bid=100.0, offer=101.0, status="TRADEABLE", min_size=0.5,
-                min_stop=10, stop_unit="POINTS", currencies=None, expiry="-"):
+                min_stop=10, stop_unit="POINTS", currencies=None, expiry="-", scale=None):
     inst = {"name": "Test Market", "expiry": expiry}
     if currencies is not None:
         inst["currencies"] = currencies
     return {
         "instrument": inst,
-        "snapshot": {"marketStatus": status, "bid": bid, "offer": offer},
+        "snapshot": {"marketStatus": status, "bid": bid, "offer": offer,
+                     **({"scalingFactor": scale} if scale else {})},
         "dealingRules": {
             "minDealSize": {"value": min_size},
             "minNormalStopOrLimitDistance": {"value": min_stop, "unit": stop_unit},
@@ -151,6 +152,22 @@ def test_market_not_tradeable(run):
     ig.create_open_position.assert_not_called()
 
 
+def test_no_live_price_still_sizes_and_orders(run):
+    ig, out, exc = run([*BASE, "--yes"], market=make_market(bid=None, offer=None))
+    assert exc is None
+    kw = ig.create_open_position.call_args.kwargs
+    assert kw["size"] == 10.0
+    assert kw["stop_distance"] == kw["limit_distance"] == 10  # still 1:1
+    assert "no price available" in out
+
+
+def test_no_live_price_percentage_min_stop_warns(run):
+    _, out, exc = run([*BASE, "--dry-run"],
+                      market=make_market(bid=None, offer=None, stop_unit="PERCENTAGE"))
+    assert exc is None
+    assert "could not be checked" in out
+
+
 def test_stop_below_broker_minimum(run):
     ig, _, exc = run(["--epic", "X", "--stop-pts", "5"], market=make_market(min_stop=10))
     assert "below broker minimum" in str(exc.code)
@@ -184,6 +201,29 @@ def test_size_rounds_down(run):
     assert ig.create_open_position.call_args.kwargs["size"] == 3.33
 
 
+def test_manual_size_overrides_risk_sizing(run):
+    ig, out, _ = run([*BASE, "--yes", "--size", "1.3"])
+    assert ig.create_open_position.call_args.kwargs["size"] == 1.3
+    assert "Warning" not in out  # 1.3 * 10 = 13 <= 100 budget
+
+
+def test_manual_size_over_budget_warns(run):
+    ig, out, _ = run([*BASE, "--yes", "--size", "50"])  # 50 * 10 = 500 > 100
+    assert ig.create_open_position.call_args.kwargs["size"] == 50
+    assert "Warning: manual size risks" in out
+
+
+def test_manual_size_below_minimum(run):
+    ig, _, exc = run([*BASE, "--yes", "--size", "0.1"], market=make_market(min_size=0.5))
+    assert "min deal size" in str(exc.code)
+    ig.create_open_position.assert_not_called()
+
+
+def test_manual_size_must_be_positive(run):
+    _, _, exc = run([*BASE, "--size", "0"])
+    assert exc.code == 2
+
+
 def test_risk_from_env(run):
     env = {**ENV, "CAPITAL": "20000", "RISK_APPETITE": "0.5"}  # risk = 100
     ig, _, _ = run(["--epic", "X", "--stop-pts", "50", "--yes"], env=env)
@@ -215,6 +255,14 @@ def test_buy_levels_and_order(run):
     assert "ACCEPTED" in out
 
 
+def test_levels_use_scaling_factor(run):
+    # EUR/USD style: 1 point = 0.0001, so a 20-point stop is 0.0020 in price
+    m = make_market(bid=1.09718, offer=1.09718, scale=10000, min_stop=1)
+    _, out, _ = run(["--epic", "X", "--stop-pts", "20", "--direction", "sell", "--dry-run"], market=m)
+    assert "Stop  1.09918" in out
+    assert "Limit 1.09518" in out
+
+
 def test_sell_levels_use_bid(run):
     ig, out, _ = run([*BASE, "--direction", "sell", "--yes"])
     assert ig.create_open_position.call_args.kwargs["direction"] == "SELL"
@@ -234,6 +282,13 @@ def test_live_flag(run):
     _, out, _ = run([*BASE, "--live", "--dry-run"])
     tradeig.login.assert_called_once_with(True)
     assert "LIVE" in out
+
+
+def test_currency_override(run):
+    m = make_market(currencies=[{"code": "USD"}])
+    ig, out, _ = run([*BASE, "--yes", "--currency", "GBP"], market=m)
+    assert ig.create_open_position.call_args.kwargs["currency_code"] == "GBP"
+    assert "GBP" in out
 
 
 # confirmation / dry run

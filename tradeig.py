@@ -16,8 +16,14 @@ from dotenv import load_dotenv
 from trading_ig import IGService
 
 
+def fmt(x: float) -> str:
+    """Price with up to 5 decimals, at least one (91.0, 1.0992)."""
+    t = f"{x:.5f}".rstrip("0")
+    return t + "0" if t.endswith(".") else t
+
+
 def login(live: bool) -> IGService:
-    load_dotenv()
+    load_dotenv(override=True)
     try:
         user, pw, key = os.environ["IG_USERNAME"], os.environ["IG_PASSWORD"], os.environ["IG_API_KEY"]
     except KeyError as e:
@@ -36,6 +42,8 @@ def main() -> None:
     p.add_argument("--live", action="store_true", help="use LIVE account (default: DEMO)")
     p.add_argument("--yes", action="store_true", help="skip confirmation prompt")
     p.add_argument("--dry-run", action="store_true", help="compute and print, do not send")
+    p.add_argument("--size", type=float, help="deal size per point; overrides the risk-based size")
+    p.add_argument("--currency", help="deal currency code, e.g. GBP")
     p.add_argument("--search", metavar="TEXT", help="search markets for an epic and exit")
     a = p.parse_args()
 
@@ -62,29 +70,58 @@ def main() -> None:
         sys.exit(f"Market not tradeable: {snap['marketStatus']}")
 
     bid, offer = snap["bid"], snap["offer"]
+    has_price = bid is not None and offer is not None
+    scale = snap.get("scalingFactor") or 1  # price units per point = 1 / scale
     min_size = rules["minDealSize"]["value"]
     min_stop = rules["minNormalStopOrLimitDistance"]["value"]
+    pct_min_stop_unchecked = False
     if rules["minNormalStopOrLimitDistance"].get("unit") == "PERCENTAGE":
-        min_stop = min_stop / 100 * (offer if a.direction == "buy" else bid)
-    currency = (inst.get("currencies") or [{}])[0].get("code", "GBP")
+        if has_price:
+            min_stop = min_stop / 100 * (offer if a.direction == "buy" else bid) * scale
+        else:
+            min_stop = 0
+            pct_min_stop_unchecked = True
+    currency = a.currency or (inst.get("currencies") or [{}])[0].get("code", "GBP")
 
     if a.stop_pts < min_stop:
         sys.exit(f"stop-pts {a.stop_pts} below broker minimum {min_stop:.1f}")
 
-    size = math.floor(risk / a.stop_pts * 100) / 100  # round DOWN: never exceed risk
-    if size < min_size:
-        need = math.ceil(risk / min_size)
-        sys.exit(f"Size {size} < min deal size {min_size}. Use --stop-pts >= {need} to stay within "
-                 f"{currency}{risk:.0f} risk.")
+    if a.size is not None:
+        size = a.size
+        if size <= 0:
+            p.error("--size must be > 0")
+        if size < min_size:
+            sys.exit(f"Size {size} < min deal size {min_size}.")
+    else:
+        size = math.floor(risk / a.stop_pts * 100) / 100  # round DOWN: never exceed risk
+        if size < min_size:
+            need = math.ceil(risk / min_size)
+            sys.exit(f"Size {size} < min deal size {min_size}. Use --stop-pts >= {need} to stay within "
+                     f"{currency}{risk:.0f} risk.")
 
-    entry = offer if a.direction == "buy" else bid
-    sgn = 1 if a.direction == "buy" else -1
-    stop_lvl, limit_lvl = entry - sgn * a.stop_pts, entry + sgn * a.stop_pts
-    print(f"{'LIVE' if a.live else 'DEMO'} | {inst['name']} ({a.epic})\n"
-          f"{a.direction.upper()} {size} {currency}/pt @ ~{entry}\n"
-          f"Stop  {stop_lvl:.1f} (-{currency}{size * a.stop_pts:.2f})\n"
-          f"Limit {limit_lvl:.1f} (+{currency}{size * a.stop_pts:.2f})\n"
-          f"Note: spread ({offer - bid:.1f} pts) and slippage are not included in risk.")
+    loss = f"-{currency}{size * a.stop_pts:.2f}"
+    gain = f"+{currency}{size * a.stop_pts:.2f}"
+    head = f"{'LIVE' if a.live else 'DEMO'} | {inst['name']} ({a.epic})\n"
+    if a.size is not None and size * a.stop_pts > risk:
+        head += (f"Warning: manual size risks {currency}{size * a.stop_pts:.2f}, "
+                 f"above your {currency}{risk:.2f} budget ({risk_pct:g}% of {capital:g}).\n")
+    if has_price:
+        entry = offer if a.direction == "buy" else bid
+        sgn = 1 if a.direction == "buy" else -1
+        dist = a.stop_pts / scale  # points -> price units
+        stop_lvl, limit_lvl = entry - sgn * dist, entry + sgn * dist
+        print(f"{head}{a.direction.upper()} {size} {currency}/pt @ ~{entry}\n"
+              f"Stop  {fmt(stop_lvl)} ({loss})\n"
+              f"Limit {fmt(limit_lvl)} ({gain})\n"
+              f"Note: spread ({(offer - bid) * scale:.1f} pts) and slippage are not included in risk.")
+    else:
+        print(f"{head}{a.direction.upper()} {size} {currency}/pt @ market (no price available)\n"
+              f"Stop  {a.stop_pts:g} pts from fill ({loss})\n"
+              f"Limit {a.stop_pts:g} pts from fill ({gain})\n"
+              f"Note: spread and slippage are not included in risk.")
+        if pct_min_stop_unchecked:
+            print("Warning: broker minimum stop is percentage-based and could not be checked; "
+                  "IG may reject a tight stop.")
 
     if a.dry_run:
         return
@@ -100,7 +137,7 @@ def main() -> None:
     print(f"{r.get('dealStatus')} ref={r.get('dealReference')} id={r.get('dealId')} "
           f"level={r.get('level')} stop={r.get('stopLevel')} limit={r.get('limitLevel')}")
     if r.get("dealStatus") != "ACCEPTED":
-        sys.exit(f"Rejected: {r.get('reason')}")
+        sys.exit(f"Rejected: {r.get('reason')}\nFull response: {dict(r)}")
 
 
 if __name__ == "__main__":
