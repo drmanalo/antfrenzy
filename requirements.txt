@@ -2,3 +2,4 @@ pandas
 munch
 trading-ig
 python-dotenv
+playwright
